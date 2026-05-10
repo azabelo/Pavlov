@@ -79,3 +79,87 @@ The Rust JSON keeps `trigger_to_write_issued`, `write_call_wall`,
 `trigger_to_write_ack`, and `request_to_response`. `btleplug` exposes the write
 as an async future rather than the exact CoreBluetooth delegate boundary, so
 `write_call_wall` is the awaited Rust write duration.
+
+## Cursor Agent Monitor
+
+`cursor_agent_monitor.py` watches Cursor's local workspace state and renderer
+logs to detect whether the frontmost agent tab is actively generating.
+It does not require macOS Screen Recording or Accessibility permissions.
+
+Run one snapshot:
+
+```bash
+python3 cursor_agent_monitor.py --once
+```
+
+Run continuously in a terminal:
+
+```bash
+python3 cursor_agent_monitor.py
+```
+
+This prints one terminal notification after the frontmost agent tab has been
+running for `3` consecutive seconds, then waits `5` seconds before checking for
+that condition again.
+
+Tune those values:
+
+```bash
+python3 cursor_agent_monitor.py --threshold 3 --wait 5
+```
+
+Run quietly in the background and keep the latest state as JSON:
+
+```bash
+nohup python3 cursor_agent_monitor.py --quiet --status-file .cursor-agent-status.json > .cursor-agent-monitor.log 2>&1 &
+```
+
+By default the monitor checks every `0.5s`, ignores whether the Cursor app is
+the frontmost macOS app, and tracks the active/frontmost agent tab inside the
+newest live-looking Cursor workspace state. Add `--print-every-poll` or
+`--print-on-change` for debugging. Add `--require-cursor-frontmost` if you only
+want `running=true` while Cursor itself has macOS focus. Add `--all-workspaces`
+if you want to scan every stored Cursor workspace.
+
+## Cursor Bracelet Monitor
+
+`cursor_agent_bracelet_monitor.py` sends Pavlok commands through the local
+daemon when a running Cursor agent crosses the configured delay. By default it
+checks every `0.1s`, waits `10` seconds per running agent before firing, and
+sends one `zap` command at `100%`.
+
+For always-on background use, install the LaunchAgents:
+
+```bash
+mkdir -p ~/.pavlov ~/Library/LaunchAgents
+install -m 755 cursor_agent_monitor.py ~/.pavlov/cursor_agent_monitor.py
+install -m 755 cursor_agent_bracelet_monitor.py ~/.pavlov/cursor_agent_bracelet_monitor.py
+cp LaunchAgents/com.pavlov.daemon.plist ~/Library/LaunchAgents/
+cp LaunchAgents/com.pavlov.cursor-bracelet-monitor.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.pavlov.daemon.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.pavlov.cursor-bracelet-monitor.plist
+```
+
+## iMessage / YouTube Monitor
+
+`detect_imessage` watches the frontmost app and prints one terminal
+notification when either condition stays true for the threshold:
+
+- Messages/iMessage is frontmost while Do Not Disturb/Focus is active.
+- A YouTube tab is frontmost in Google Chrome or Safari.
+
+Run continuously:
+
+```bash
+./detect_imessage --threshold 3 --wait 5
+```
+
+Debug one snapshot:
+
+```bash
+./detect_imessage --once --json
+```
+
+Like the Cursor monitor, it checks every `0.5s` by default, waits `5` seconds
+after each notification before checking again, and supports `--print-every-poll`,
+`--print-on-change`, and `--status-file`.
