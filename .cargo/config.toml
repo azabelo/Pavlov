@@ -1,0 +1,8 @@
+[alias]
+app-bundle = "run --bin pavlov-bundle --"
+
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/cc"

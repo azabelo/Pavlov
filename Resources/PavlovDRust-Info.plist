@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>pavlovd-rs</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.pavlov.PavlovDRust</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>PavlovD Rust</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSBackgroundOnly</key>
+  <true/>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>PavlovD Rust uses Bluetooth to send local low-latency stimuli to your Pavlok 3.</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>PavlovD Rust uses Bluetooth to send local low-latency stimuli to your Pavlok 3.</string>
+</dict>
+</plist>
