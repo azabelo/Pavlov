@@ -33,11 +33,11 @@ from cursor_agent_monitor import (
 DEFAULT_INTERVAL_SECONDS = 0.1
 DEFAULT_COOLDOWN_SECONDS = 10.0
 DEFAULT_BRACELET_BASE_URL = "http://127.0.0.1:8765"
-DEFAULT_COMMANDS = os.environ.get("COMMANDS", "zap,beep")
+DEFAULT_COMMANDS = os.environ.get("COMMANDS", "zap")
 DEFAULT_COMMAND = os.environ.get("COMMAND", DEFAULT_COMMANDS)
 DEFAULT_INTENSITY = 100
 DEFAULT_COUNT = 1
-DEFAULT_NUM_ZAPS = 10
+DEFAULT_NUM_ZAPS = 1
 DEFAULT_NUM_BEEPS = 10
 DEFAULT_ZAP_INTERVAL_SECONDS = 0.05
 DEFAULT_BEEP_INTERVAL_SECONDS = 0.05
@@ -301,7 +301,7 @@ def parse_args() -> argparse.Namespace:
         "--commands",
         type=parse_commands,
         default=parse_commands(DEFAULT_COMMAND),
-        help="comma-separated bracelet commands to send; default is zap,beep",
+        help="comma-separated bracelet commands to send; default is zap",
     )
     parser.add_argument(
         "--intensity",

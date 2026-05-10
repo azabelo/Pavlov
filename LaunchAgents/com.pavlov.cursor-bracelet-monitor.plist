@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pavlov.cursor-bracelet-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/andrewzabelo/.pavlov/cursor_agent_bracelet_monitor.py</string>
+    <string>--print-bracelet-result</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/andrewzabelo/.pavlov</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/cursor-agent-bracelet-monitor.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/cursor-agent-bracelet-monitor.stderr.log</string>
+</dict>
+</plist>
