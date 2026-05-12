@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pavlov.signal-monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/andrewzabelo/Desktop/Pavlov/.build/PavlovD-Rust.app/Contents/MacOS/pavlovd-rs</string>
+    <string>monitor</string>
+    <string>--intensity</string>
+    <string>100</string>
+    <string>--cooldown-secs</string>
+    <string>30</string>
+    <string>--dnd-command</string>
+    <string>/Users/andrewzabelo/.pavlov/dnd-active</string>
+    <string>--zap-url</string>
+    <string>http://127.0.0.1:8765/stim/zap?intensity=100&amp;count=1</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/pavlov-signal-monitor.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pavlov-signal-monitor.stderr.log</string>
+</dict>
+</plist>

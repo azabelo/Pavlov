@@ -17,6 +17,9 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
+mod signals;
+use signals::{RuleScope, SignalConfig, SignalCooldowns, SignalRule, SignalRuleKind};
+
 const VIBE_UUID: &str = "00001001-0000-1000-8000-00805f9b34fb";
 const BEEP_UUID: &str = "00001002-0000-1000-8000-00805f9b34fb";
 const ZAP_UUID: &str = "00001003-0000-1000-8000-00805f9b34fb";
@@ -111,6 +114,8 @@ enum Command {
     Once(OnceArgs),
     Serve(ServeArgs),
     Stdin(CommonArgs),
+    Monitor(MonitorArgs),
+    Rules(RulesArgs),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -159,6 +164,60 @@ struct ServeArgs {
     host: String,
     #[arg(long, default_value_t = 8765)]
     port: u16,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct MonitorArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    #[arg(long, default_value_t = 1_000)]
+    poll_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    cooldown_secs: u64,
+    #[arg(long)]
+    rules_file: Option<String>,
+    #[arg(long)]
+    dnd_command: Option<String>,
+    #[arg(long, default_value = "http://127.0.0.1:8765/stim/zap")]
+    zap_url: String,
+    #[arg(long, default_value_t = false)]
+    direct_ble: bool,
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct RulesArgs {
+    #[arg(long, global = true)]
+    rules_file: Option<String>,
+    #[command(subcommand)]
+    command: RulesCommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum RulesCommand {
+    List,
+    Path,
+    AddApp {
+        name: String,
+        #[arg(long, default_value_t = RuleScope::Dnd)]
+        scope: RuleScope,
+    },
+    AddSite {
+        pattern: String,
+        #[arg(long, default_value_t = RuleScope::Always)]
+        scope: RuleScope,
+    },
+    RemoveApp {
+        name: String,
+        #[arg(long)]
+        scope: Option<RuleScope>,
+    },
+    RemoveSite {
+        pattern: String,
+        #[arg(long)]
+        scope: Option<RuleScope>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +409,35 @@ async fn main() -> Result<()> {
             })?;
             run_stdin(args, client).await?;
         }
+        Command::Monitor(args) => {
+            setup_logging(args.common.log_file.as_deref())?;
+            if !args.dry_run && args.direct_ble {
+                validate_zap_config(&args.common)?;
+                ensure_zap_allowed(Stimulus::Zap, &args.common)?;
+            }
+            let config = SignalConfig::load(args.rules_file.as_deref())?;
+            print_json(&serde_json::json!({
+                "ok": true,
+                "monitoring": true,
+                "rules_file": SignalConfig::path(args.rules_file.as_deref())?,
+                "rules": config.rules.len(),
+                "dry_run": args.dry_run,
+                "zap_url": args.zap_url,
+                "direct_ble": args.direct_ble,
+            }))?;
+            if args.dry_run || !args.direct_ble {
+                run_monitor(args, None, config).await?;
+            } else {
+                let started = Instant::now();
+                let client = connect(&args.common).await?;
+                print_json(&ConnectBody {
+                    connected: true,
+                    cold_connect_ms: ms_since(started),
+                })?;
+                run_monitor(args, Some(client), config).await?;
+            }
+        }
+        Command::Rules(args) => run_rules(args)?,
     }
     Ok(())
 }
@@ -913,6 +1001,265 @@ async fn run_stdin(args: CommonArgs, client: PavlokClient) -> Result<()> {
     Ok(())
 }
 
+async fn run_monitor(
+    args: MonitorArgs,
+    client: Option<PavlokClient>,
+    config: SignalConfig,
+) -> Result<()> {
+    let mut cooldowns = SignalCooldowns::new(Duration::from_secs(args.cooldown_secs));
+    let mut warnings_seen = std::collections::HashSet::new();
+    loop {
+        let (snapshot, warnings) = signals::read_snapshot(args.dnd_command.as_deref());
+        for warning in warnings {
+            if warnings_seen.insert(warning.clone()) {
+                eprintln!("monitor warning: {warning}");
+            }
+        }
+
+        for violation in config.violations(&snapshot) {
+            if !cooldowns.ready(violation.cooldown_key(), Instant::now()) {
+                continue;
+            }
+            let reason = signal_notification_reason(&violation);
+
+            let body = serde_json::json!({
+                "ok": true,
+                "signal": violation.signal_name(),
+                "rule": violation.rule,
+                "reason": reason,
+                "frontmost_app": snapshot.frontmost_app,
+                "browser_url": snapshot.browser_url,
+                "browser_title": snapshot.browser_title,
+                "dnd_enabled": snapshot.dnd_enabled,
+                "dry_run": args.dry_run,
+            });
+            print_json(&body)?;
+
+            if let Some(client) = &client {
+                match client
+                    .send(default_request(&args.common, Stimulus::Zap), Instant::now())
+                    .await
+                {
+                    Ok(body) => {
+                        let notification_requested = notify_zap_sent(&reason);
+                        print_json(&serde_json::json!({
+                            "ok": true,
+                            "stim": body.stim,
+                            "mode": body.mode,
+                            "payload_hex": body.payload_hex,
+                            "timing_ms": body.timing_ms,
+                            "notification_requested": notification_requested,
+                        }))?
+                    }
+                    Err(error) => {
+                        print_json(&serde_json::json!({
+                            "ok": false,
+                            "signal": violation.signal_name(),
+                            "error": error.to_string(),
+                        }))?;
+                    }
+                }
+            } else if !args.dry_run {
+                match send_zap_http(&args.zap_url, &args.common).await {
+                    Ok(response) => {
+                        let notification_requested = notify_zap_sent(&reason);
+                        print_json(&serde_json::json!({
+                            "ok": true,
+                            "stim": "zap",
+                            "via": "http",
+                            "zap_url": args.zap_url,
+                            "response": response,
+                            "notification_requested": notification_requested,
+                        }))?
+                    }
+                    Err(error) => print_json(&serde_json::json!({
+                        "ok": false,
+                        "stim": "zap",
+                        "via": "http",
+                        "zap_url": args.zap_url,
+                        "error": error.to_string(),
+                    }))?,
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(args.poll_ms)).await;
+    }
+}
+
+fn signal_notification_reason(violation: &signals::SignalViolation<'_>) -> String {
+    match (violation.rule.kind, violation.rule.scope) {
+        (SignalRuleKind::App, RuleScope::Always) => {
+            format!("{} opened", violation.rule.pattern)
+        }
+        (SignalRuleKind::App, RuleScope::Dnd) => {
+            format!("{} opened during Do Not Disturb", violation.rule.pattern)
+        }
+        (SignalRuleKind::Website, RuleScope::Always) => {
+            format!("Website matched {}", violation.rule.pattern)
+        }
+        (SignalRuleKind::Website, RuleScope::Dnd) => {
+            format!(
+                "Website matched {} during Do Not Disturb",
+                violation.rule.pattern
+            )
+        }
+    }
+}
+
+fn notify_zap_sent(reason: &str) -> bool {
+    let script = format!(
+        r#"display notification "{}" with title "Pavlov zap sent""#,
+        escape_osascript_string(reason)
+    );
+    match std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(script)
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(error) => {
+            eprintln!("notification error: {error}");
+            false
+        }
+    }
+}
+
+fn escape_osascript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn send_zap_http(url: &str, defaults: &CommonArgs) -> Result<String> {
+    let parsed = parse_http_url(url)?;
+    let target = target_with_stim_defaults(&parsed.target, defaults);
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((parsed.host.as_str(), parsed.port)),
+    )
+    .await
+    .context("zap HTTP connect timed out")?
+    .with_context(|| format!("connect {}:{}", parsed.host, parsed.port))?;
+    let request = format!(
+        "POST {target} HTTP/1.1\r\nHost: {}:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        parsed.host, parsed.port
+    );
+    timeout(Duration::from_secs(5), stream.write_all(request.as_bytes()))
+        .await
+        .context("zap HTTP write timed out")?
+        .context("write zap HTTP request")?;
+
+    let mut response = String::new();
+    timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+        .await
+        .context("zap HTTP response timed out")?
+        .context("read zap HTTP response")?;
+    let status_line = response.lines().next().unwrap_or_default();
+    if status_line.contains(" 2") {
+        Ok(response
+            .split_once("\r\n\r\n")
+            .or_else(|| response.split_once("\n\n"))
+            .map(|(_, body)| body.trim().to_string())
+            .unwrap_or_default())
+    } else {
+        bail!(
+            "zap HTTP request failed: {}",
+            response.lines().take(1).collect::<Vec<_>>().join("")
+        )
+    }
+}
+
+struct ParsedHttpUrl {
+    host: String,
+    port: u16,
+    target: String,
+}
+
+fn parse_http_url(url: &str) -> Result<ParsedHttpUrl> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow!("only http:// zap URLs are supported"))?;
+    let (host_port, target) = rest.split_once('/').unwrap_or((rest, ""));
+    let target = format!("/{target}");
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().context("parse zap URL port")?),
+        None => (host_port, 80),
+    };
+    if host.is_empty() {
+        bail!("zap URL host cannot be empty");
+    }
+    Ok(ParsedHttpUrl {
+        host: host.to_string(),
+        port,
+        target,
+    })
+}
+
+fn target_with_stim_defaults(target: &str, defaults: &CommonArgs) -> String {
+    let separator = if target.contains('?') { '&' } else { '?' };
+    format!(
+        "{target}{separator}intensity={}&count={}&on_ms={}&off_ms={}&mode={}",
+        defaults.intensity.clamp(1, 100),
+        defaults.count.clamp(1, 7),
+        defaults.on_ms.max(1),
+        defaults.off_ms.max(1),
+        defaults.mode,
+    )
+}
+
+fn run_rules(args: RulesArgs) -> Result<()> {
+    let path = SignalConfig::path(args.rules_file.as_deref())?;
+    match args.command {
+        RulesCommand::Path => {
+            println!("{}", path.display());
+            Ok(())
+        }
+        RulesCommand::List => {
+            let config = SignalConfig::load(args.rules_file.as_deref())?;
+            println!("rules_file {}", path.display());
+            for rule in &config.rules {
+                println!("{} {} {}", rule.kind, rule.scope, rule.pattern);
+            }
+            Ok(())
+        }
+        RulesCommand::AddApp { name, scope } => {
+            let mut config = SignalConfig::load(args.rules_file.as_deref())?;
+            let added = config.add_rule(SignalRule::new(SignalRuleKind::App, scope, name)?);
+            config.save(args.rules_file.as_deref())?;
+            println!(
+                "{} app rule in {}",
+                if added { "added" } else { "already had" },
+                path.display()
+            );
+            Ok(())
+        }
+        RulesCommand::AddSite { pattern, scope } => {
+            let mut config = SignalConfig::load(args.rules_file.as_deref())?;
+            let added = config.add_rule(SignalRule::new(SignalRuleKind::Website, scope, pattern)?);
+            config.save(args.rules_file.as_deref())?;
+            println!(
+                "{} website rule in {}",
+                if added { "added" } else { "already had" },
+                path.display()
+            );
+            Ok(())
+        }
+        RulesCommand::RemoveApp { name, scope } => {
+            let mut config = SignalConfig::load(args.rules_file.as_deref())?;
+            let removed = config.remove_rule(SignalRuleKind::App, scope, &name);
+            config.save(args.rules_file.as_deref())?;
+            println!("removed {removed} app rule(s) from {}", path.display());
+            Ok(())
+        }
+        RulesCommand::RemoveSite { pattern, scope } => {
+            let mut config = SignalConfig::load(args.rules_file.as_deref())?;
+            let removed = config.remove_rule(SignalRuleKind::Website, scope, &pattern);
+            config.save(args.rules_file.as_deref())?;
+            println!("removed {removed} website rule(s) from {}", path.display());
+            Ok(())
+        }
+    }
+}
+
 fn request_from_line(line: &str, defaults: &CommonArgs) -> Result<StimRequest> {
     let mut parts = line.split_whitespace();
     let stim = <Stimulus as FromStr>::from_str(
@@ -1341,6 +1688,26 @@ mod tests {
         assert_eq!(path, "/stim/vibe");
         assert_eq!(query.get("intensity").map(String::as_str), Some("55"));
         assert_eq!(query.get("mode").map(String::as_str), Some("no-response"));
+    }
+
+    #[test]
+    fn parses_monitor_zap_url_and_appends_defaults() {
+        let parsed = parse_http_url("http://127.0.0.1:8765/stim/zap").expect("parse url");
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 8765);
+        assert_eq!(parsed.target, "/stim/zap");
+
+        let target = target_with_stim_defaults(&parsed.target, &test_defaults());
+        assert_eq!(
+            target,
+            "/stim/zap?intensity=50&count=1&on_ms=22&off_ms=22&mode=response"
+        );
+
+        let target = target_with_stim_defaults("/stim/zap?source=monitor", &test_defaults());
+        assert_eq!(
+            target,
+            "/stim/zap?source=monitor&intensity=50&count=1&on_ms=22&off_ms=22&mode=response"
+        );
     }
 
     #[test]
