@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -31,7 +32,8 @@ from cursor_agent_monitor import (
 
 
 DEFAULT_INTERVAL_SECONDS = 0.1
-DEFAULT_COOLDOWN_SECONDS = 10.0
+DEFAULT_WAIT_SECONDS = 10.0
+DEFAULT_COOLDOWN_SECONDS = 30.0
 DEFAULT_BRACELET_BASE_URL = "http://127.0.0.1:8765"
 DEFAULT_COMMANDS = os.environ.get("COMMANDS", "zap")
 DEFAULT_COMMAND = os.environ.get("COMMAND", DEFAULT_COMMANDS)
@@ -89,6 +91,27 @@ def bracelet_result_line(status: dict[str, Any], command: str, result: dict[str,
     if result.get("ok"):
         return base
     return f"{base} error={result.get('error') or '-'}"
+
+
+def notify_zap_sent(reason: str) -> None:
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                f'display notification "{escape_applescript(reason)}" with title "Pavlov zap sent"',
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def escape_applescript(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def command_send_count(command: str, num_zaps: int, num_beeps: int) -> int:
@@ -189,6 +212,7 @@ def visible_stopped_agent_keys(status: dict[str, Any]) -> set[tuple[str, str]]:
 @dataclass
 class PerAgentAgeCooldownNotifier:
     delay_seconds: float
+    cooldown_seconds: float
     running_since_by_key: dict[tuple[str, str], float] | None = None
     cooldown_until_by_key: dict[tuple[str, str], float] | None = None
 
@@ -218,7 +242,7 @@ class PerAgentAgeCooldownNotifier:
         if monotonic_now < self.cooldown_until_by_key.get(current_key, 0.0):
             return False
 
-        self.cooldown_until_by_key[current_key] = monotonic_now + max(self.delay_seconds, 0.0)
+        self.cooldown_until_by_key[current_key] = monotonic_now + max(self.cooldown_seconds, 0.0)
         return True
 
 
@@ -247,8 +271,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wait",
         type=float,
+        default=DEFAULT_WAIT_SECONDS,
+        help="seconds the agent must be running before firing",
+    )
+    parser.add_argument(
+        "--cooldown",
+        type=float,
         default=DEFAULT_COOLDOWN_SECONDS,
-        help="seconds the agent must be running before firing, and cooldown seconds after firing",
+        help="seconds to wait after a Cursor agent zap before firing again",
     )
     parser.add_argument(
         "--status-file",
@@ -366,7 +396,7 @@ def main() -> int:
 
     require_cursor_frontmost = not args.ignore_frontmost
     last_change_key: str | None = None
-    notifier = PerAgentAgeCooldownNotifier(max(args.wait, 0.0))
+    notifier = PerAgentAgeCooldownNotifier(max(args.wait, 0.0), max(args.cooldown, 0.0))
 
     while True:
         status = make_status(
@@ -405,6 +435,8 @@ def main() -> int:
                         timeout=args.bracelet_timeout,
                     )
                 for command, result in command_results:
+                    if command.startswith("zap") and result.get("ok"):
+                        notify_zap_sent(f"Cursor agent running for {max(args.wait, 0.0):g} seconds")
                     if not result.get("ok"):
                         print(bracelet_result_line(status, command, result), file=sys.stderr, flush=True)
                     elif not args.quiet and args.print_bracelet_result:

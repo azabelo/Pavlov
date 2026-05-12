@@ -12,6 +12,8 @@
     <string>Pavlok-3-FE73</string>
     <string>--mode</string>
     <string>response</string>
+    <string>--connect-timeout-ms</string>
+    <string>60000</string>
     <string>--allow-zap</string>
     <string>--log-file</string>
     <string>/tmp/pavlovd-rs.log</string>

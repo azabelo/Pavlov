@@ -20,6 +20,7 @@ target/release/pavlovd-rs scan --scan-timeout-ms 3000
 target/release/pavlovd-rs once --name Pavlok-3-E14D --stim vibe --mode response
 target/release/pavlovd-rs serve --name Pavlok-3-E14D --mode response
 target/release/pavlovd-rs stdin --name Pavlok-3-E14D --mode response
+target/release/pavlovd-rs monitor --intensity 100
 ```
 
 The warm HTTP daemon listens on `127.0.0.1:8765` by default. It exposes the
@@ -57,6 +58,52 @@ curl -s -X POST 'http://127.0.0.1:8765/webtool/findCancel'
 `--allow-zap`. Zap remains gated behind `--allow-zap`, and `response` remains
 the default write mode because this Pavlok 3 did not advertise
 `writeWithoutResponse` for the vibe/beep characteristics.
+
+## Signal Monitor
+
+`monitor` watches local activity and sends a zap when a configured rule matches.
+By default it posts to the already-running local daemon, so it does not open a
+second BLE connection.
+The default rules are:
+
+| Rule | Scope | Cooldown |
+| --- | --- | --- |
+| Frontmost app contains `Messages` | Do Not Disturb only | 30 seconds |
+| Frontmost app contains `Outlook` | Do Not Disturb only | 30 seconds |
+| Browser URL/title contains `youtube` | Always | 30 seconds |
+
+```sh
+target/release/pavlovd-rs monitor \
+  --intensity 100 \
+  --cooldown-secs 30
+```
+
+By default, `monitor` sends zaps through the already-running local HTTP daemon
+at `http://127.0.0.1:8765/stim/zap`, which avoids opening a second BLE
+connection. For one-process diagnostic runs, pass `--direct-ble` with
+`--allow-zap` and an explicit `--name` or `--uuid`.
+
+Rules live in `~/.config/pavlov/rules.json` unless `--rules-file` is provided:
+
+```sh
+target/release/pavlovd-rs rules list
+target/release/pavlovd-rs rules add-app Slack --scope dnd
+target/release/pavlovd-rs rules add-app Discord --scope always
+target/release/pavlovd-rs rules add-site reddit.com --scope dnd
+target/release/pavlovd-rs rules add-site x.com --scope always
+target/release/pavlovd-rs rules remove-site reddit.com --scope dnd
+```
+
+The monitor reads the frontmost app with AppleScript and checks Safari,
+Chrome-family browsers, Arc, Dia, Opera, Edge, Brave, and Firefox window titles
+for website rules. macOS does not provide a stable public Focus status API, so
+Do Not Disturb detection uses best-effort fallbacks. If those do not work on
+your macOS version, pass a command that returns or exits truthy when DND is on:
+
+```sh
+target/release/pavlovd-rs monitor \
+  --dnd-command 'test -f /tmp/pavlov-dnd-on'
+```
 
 ## BLE Packets
 
