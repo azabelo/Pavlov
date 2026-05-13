@@ -70,7 +70,8 @@ The default rules are:
 | --- | --- | --- |
 | Frontmost app contains `Messages` | Do Not Disturb only | 30 seconds |
 | Frontmost app contains `Outlook` | Do Not Disturb only | 30 seconds |
-| Browser URL/title contains `youtube` | Always | 30 seconds |
+| Browser URL is the YouTube homepage | Always | 30 seconds |
+| Browser URL/title contains `linkedin` | Always | 30 seconds |
 
 ```sh
 target/release/pavlovd-rs monitor \

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,9 +25,19 @@ const VIBE_UUID: &str = "00001001-0000-1000-8000-00805f9b34fb";
 const BEEP_UUID: &str = "00001002-0000-1000-8000-00805f9b34fb";
 const ZAP_UUID: &str = "00001003-0000-1000-8000-00805f9b34fb";
 const LEDS_UUID: &str = "00001004-0000-1000-8000-00805f9b34fb";
+const TIME_UUID: &str = "00001005-0000-1000-8000-00805f9b34fb";
+const ALARM_TIME_UUID: &str = "0000200a-0000-1000-8000-00805f9b34fb";
+const ALARM_CONTROL_UUID: &str = "00005001-0000-1000-8000-00805f9b34fb";
+const ALARM_WRITE_UUID: &str = "00005002-0000-1000-8000-00805f9b34fb";
 const SETUP_UUID: &str = "00007001-0000-1000-8000-00805f9b34fb";
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_ACTION_TIMEOUT: Duration = Duration::from_secs(10);
+const BLE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const WAKEUP_ALARM_PROFILE: &str = "Pavlov Wake";
+const WAKEUP_ALARM_ID_BASE: u16 = 905;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum Stimulus {
     Vibe,
     Beep,
@@ -243,6 +254,10 @@ enum StimulusKey {
     Beep,
     Zap,
     Leds,
+    Time,
+    AlarmTime,
+    AlarmControl,
+    AlarmWrite,
     Setup,
 }
 
@@ -263,7 +278,64 @@ impl StimulusKey {
             StimulusKey::Beep => "c_beep",
             StimulusKey::Zap => "c_zap",
             StimulusKey::Leds => "c_leds",
+            StimulusKey::Time => "c_time",
+            StimulusKey::AlarmTime => "c_atime",
+            StimulusKey::AlarmControl => "c_actl",
+            StimulusKey::AlarmWrite => "c_awrite",
             StimulusKey::Setup => "c_setup",
+        }
+    }
+}
+
+struct VibeAlarmRequest {
+    minutes: u16,
+    intensity: u8,
+    count: u8,
+    name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct WakeupAlarmState {
+    profile: String,
+    alarms: Vec<WakeupAlarmRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct WakeupAlarmRecord {
+    name: String,
+    stim: Stimulus,
+    scheduled_time: String,
+    scheduled_hour: u8,
+    scheduled_minute: u8,
+    alarm_id: u16,
+    intensity: u8,
+    count: u8,
+}
+
+struct AlarmEntry {
+    name: String,
+    stim: Stimulus,
+    hour: u8,
+    minute: u8,
+    alarm_id: u16,
+    intensity: u8,
+    count: u8,
+    active: bool,
+}
+
+impl AlarmEntry {
+    fn record(&self) -> WakeupAlarmRecord {
+        WakeupAlarmRecord {
+            name: self.name.clone(),
+            stim: self.stim,
+            scheduled_time: format!("{:02}:{:02}", self.hour, self.minute),
+            scheduled_hour: self.hour,
+            scheduled_minute: self.minute,
+            alarm_id: self.alarm_id,
+            intensity: self.intensity,
+            count: self.count,
         }
     }
 }
@@ -298,6 +370,33 @@ struct WebtoolBody {
     characteristic: String,
     mode: &'static str,
     payload_hex: String,
+    timing_ms: Timing,
+}
+
+#[derive(Serialize)]
+struct AlarmScheduleBody {
+    ok: bool,
+    name: String,
+    scheduled_time: String,
+    scheduled_hour: u8,
+    scheduled_minute: u8,
+    alarm_id: u16,
+    payload_hex: String,
+    chunks: usize,
+    next_alarm: Option<String>,
+    timing_ms: Timing,
+}
+
+#[derive(Serialize)]
+struct AlarmBatchBody {
+    ok: bool,
+    action: &'static str,
+    profile: String,
+    alarms: Vec<WakeupAlarmRecord>,
+    payload_hex: String,
+    chunks: usize,
+    next_alarm: Option<String>,
+    state_file: String,
     timing_ms: Timing,
 }
 
@@ -543,6 +642,20 @@ async fn connect_peripheral(peripheral: Peripheral, allow_zap: bool) -> Result<P
             chars.insert(StimulusKey::Zap, characteristic);
         } else if characteristic.uuid == Uuid::parse_str(LEDS_UUID).expect("valid leds uuid") {
             chars.insert(StimulusKey::Leds, characteristic);
+        } else if characteristic.uuid == Uuid::parse_str(TIME_UUID).expect("valid time uuid") {
+            chars.insert(StimulusKey::Time, characteristic);
+        } else if characteristic.uuid
+            == Uuid::parse_str(ALARM_TIME_UUID).expect("valid alarm time uuid")
+        {
+            chars.insert(StimulusKey::AlarmTime, characteristic);
+        } else if characteristic.uuid
+            == Uuid::parse_str(ALARM_CONTROL_UUID).expect("valid alarm control uuid")
+        {
+            chars.insert(StimulusKey::AlarmControl, characteristic);
+        } else if characteristic.uuid
+            == Uuid::parse_str(ALARM_WRITE_UUID).expect("valid alarm write uuid")
+        {
+            chars.insert(StimulusKey::AlarmWrite, characteristic);
         } else if characteristic.uuid == Uuid::parse_str(SETUP_UUID).expect("valid setup uuid") {
             chars.insert(StimulusKey::Setup, characteristic);
         }
@@ -616,6 +729,161 @@ impl PavlokClient {
         })
     }
 
+    async fn schedule_vibe_alarm(
+        &self,
+        request: VibeAlarmRequest,
+        trigger_started: Instant,
+    ) -> Result<AlarmScheduleBody> {
+        let alarm_time =
+            local_alarm_time(request.minutes).context("read local target alarm time")?;
+        let alarm_id = alarm_id_from_time(&local_date_parts(0)?);
+        let entry = AlarmEntry {
+            name: request.name,
+            stim: Stimulus::Vibe,
+            hour: alarm_time.hour,
+            minute: alarm_time.minute,
+            alarm_id,
+            intensity: request.intensity,
+            count: request.count,
+            active: true,
+        };
+        let result = self
+            .write_alarm_entries("schedule", "Single 1", &[entry], trigger_started)
+            .await?;
+        let alarm = result
+            .alarms
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("alarm write returned no alarms"))?;
+
+        Ok(AlarmScheduleBody {
+            ok: true,
+            name: alarm.name,
+            scheduled_time: alarm.scheduled_time,
+            scheduled_hour: alarm.scheduled_hour,
+            scheduled_minute: alarm.scheduled_minute,
+            alarm_id: alarm.alarm_id,
+            payload_hex: result.payload_hex,
+            chunks: result.chunks,
+            next_alarm: result.next_alarm,
+            timing_ms: result.timing_ms,
+        })
+    }
+
+    async fn write_alarm_entries(
+        &self,
+        action: &'static str,
+        profile: &str,
+        entries: &[AlarmEntry],
+        trigger_started: Instant,
+    ) -> Result<AlarmBatchBody> {
+        if entries.is_empty() {
+            bail!("alarm write needs at least one entry");
+        }
+        if entries
+            .iter()
+            .any(|entry| entry.stim == Stimulus::Zap && !self.allow_zap)
+        {
+            bail!("Zap alarms are disabled. Restart with --allow-zap only when you intend to zap.");
+        }
+
+        let now = local_date_parts(0).context("read local time for bracelet sync")?;
+        let time_payload = pavlok_time_payload(&now);
+        let alarm_payload = build_alarm_file(profile, entries);
+
+        let mut timing = Timing::default();
+        let time_result = self
+            .write_payload(
+                StimulusKey::Time,
+                &time_payload,
+                WriteMode::Response,
+                trigger_started,
+            )
+            .await
+            .context("write bracelet time")?;
+        merge_write_timing(&mut timing, time_result.timing_ms);
+
+        if let Some(characteristic) = self.chars.get(&StimulusKey::AlarmWrite)
+            && characteristic.properties.contains(CharPropFlags::NOTIFY)
+        {
+            self.peripheral
+                .subscribe(characteristic)
+                .await
+                .context("subscribe to alarm write notifications")?;
+        }
+
+        let start_result = self
+            .write_payload(
+                StimulusKey::AlarmControl,
+                &[1],
+                WriteMode::Response,
+                trigger_started,
+            )
+            .await
+            .context("begin alarm write")?;
+        merge_write_timing(&mut timing, start_result.timing_ms);
+        sleep(Duration::from_millis(100)).await;
+
+        for chunk in alarm_payload.chunks(20) {
+            let chunk_result = self
+                .write_payload(
+                    StimulusKey::AlarmWrite,
+                    chunk,
+                    WriteMode::NoResponse,
+                    trigger_started,
+                )
+                .await
+                .context("write alarm payload chunk")?;
+            merge_write_timing(&mut timing, chunk_result.timing_ms);
+        }
+        sleep(Duration::from_secs(2)).await;
+
+        let finish_result = self
+            .write_payload(
+                StimulusKey::AlarmControl,
+                &[0],
+                WriteMode::Response,
+                trigger_started,
+            )
+            .await
+            .context("finish alarm write")?;
+        merge_write_timing(&mut timing, finish_result.timing_ms);
+
+        sleep(Duration::from_millis(300)).await;
+        let next_alarm = self
+            .read_payload(StimulusKey::AlarmTime)
+            .await
+            .ok()
+            .and_then(|payload| parse_next_alarm(&payload));
+
+        Ok(AlarmBatchBody {
+            ok: true,
+            action,
+            profile: profile.to_string(),
+            alarms: entries.iter().map(AlarmEntry::record).collect(),
+            payload_hex: hex(&alarm_payload),
+            chunks: alarm_payload.len().div_ceil(20),
+            next_alarm,
+            state_file: wakeup_alarm_state_path().display().to_string(),
+            timing_ms: timing,
+        })
+    }
+
+    async fn read_payload(&self, characteristic_key: StimulusKey) -> Result<Vec<u8>> {
+        let characteristic = self
+            .chars
+            .get(&characteristic_key)
+            .ok_or_else(|| anyhow!("Missing {} characteristic.", characteristic_key.as_str()))?;
+        if !characteristic.properties.contains(CharPropFlags::READ) {
+            bail!("{} does not advertise read.", characteristic_key.as_str());
+        }
+        let bytes = timeout(BLE_WRITE_TIMEOUT, self.peripheral.read(characteristic))
+            .await
+            .with_context(|| format!("read {} timed out", characteristic_key.as_str()))?
+            .with_context(|| format!("read {}", characteristic_key.as_str()))?;
+        Ok(bytes)
+    }
+
     async fn write_payload(
         &self,
         characteristic_key: StimulusKey,
@@ -630,10 +898,14 @@ impl PavlokClient {
         validate_write_mode(characteristic, mode, characteristic_key.as_str())?;
 
         let write_started = Instant::now();
-        self.peripheral
-            .write(characteristic, payload, mode.btleplug())
-            .await
-            .with_context(|| format!("write {}", characteristic_key.as_str()))?;
+        timeout(
+            BLE_WRITE_TIMEOUT,
+            self.peripheral
+                .write(characteristic, payload, mode.btleplug()),
+        )
+        .await
+        .with_context(|| format!("write {} timed out", characteristic_key.as_str()))?
+        .with_context(|| format!("write {}", characteristic_key.as_str()))?;
         let ack_ms = ms_since(trigger_started);
         let timing = Timing {
             trigger_to_write_issued: Some(ms_between(trigger_started, write_started)),
@@ -791,15 +1063,27 @@ async fn handle_http(
     defaults: CommonArgs,
 ) -> Result<()> {
     let request_started = Instant::now();
-    let request = match read_http_request(&mut stream).await {
-        Ok(request) => request,
-        Err(error) => {
+    let request = match timeout(HTTP_REQUEST_TIMEOUT, read_http_request(&mut stream)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
             return write_response(
                 &mut stream,
                 400,
                 ErrorBody {
                     ok: false,
                     error: error.to_string(),
+                    timing_ms: timing_with_response(request_started),
+                },
+            )
+            .await;
+        }
+        Err(_) => {
+            return write_response(
+                &mut stream,
+                408,
+                ErrorBody {
+                    ok: false,
+                    error: "HTTP request timed out".to_string(),
                     timing_ms: timing_with_response(request_started),
                 },
             )
@@ -812,13 +1096,17 @@ async fn handle_http(
     let (path, query) = parse_target(target);
     let body = request.body.as_str();
     if method == "GET" && path == "/health" {
-        let connected = client
-            .lock()
-            .await
-            .peripheral
-            .is_connected()
-            .await
-            .unwrap_or(false);
+        let connected = timeout(HTTP_REQUEST_TIMEOUT, async {
+            client
+                .lock()
+                .await
+                .peripheral
+                .is_connected()
+                .await
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false);
         return write_response(
             &mut stream,
             200,
@@ -847,17 +1135,21 @@ async fn handle_http(
                 .await;
             }
         };
-        let result = client
-            .lock()
-            .await
-            .send(stimulus_request, request_started)
-            .await;
+        let result = timeout(HTTP_ACTION_TIMEOUT, async {
+            client
+                .lock()
+                .await
+                .send(stimulus_request, request_started)
+                .await
+        })
+        .await
+        .context("stimulus request timed out");
         return match result {
-            Ok(mut body) => {
+            Ok(Ok(mut body)) => {
                 body.timing_ms.request_to_response = Some(ms_since(request_started));
                 write_response(&mut stream, 200, body).await
             }
-            Err(error) => {
+            Ok(Err(error)) | Err(error) => {
                 write_response(
                     &mut stream,
                     500,
@@ -888,17 +1180,190 @@ async fn handle_http(
                 .await;
             }
         };
-        let result = client
-            .lock()
-            .await
-            .send_webtool(command, request_started)
-            .await;
+        let result = timeout(HTTP_ACTION_TIMEOUT, async {
+            client
+                .lock()
+                .await
+                .send_webtool(command, request_started)
+                .await
+        })
+        .await
+        .context("Webtool request timed out");
         return match result {
-            Ok(mut body) => {
+            Ok(Ok(mut body)) => {
                 body.timing_ms.request_to_response = Some(ms_since(request_started));
                 write_response(&mut stream, 200, body).await
             }
+            Ok(Err(error)) | Err(error) => {
+                write_response(
+                    &mut stream,
+                    500,
+                    ErrorBody {
+                        ok: false,
+                        error: error.to_string(),
+                        timing_ms: timing_with_response(request_started),
+                    },
+                )
+                .await
+            }
+        };
+    }
+
+    if method == "POST" && path == "/alarm/vibe" {
+        let minutes = get_u16(&query, "minutes", 1, 1, 1440);
+        let request = VibeAlarmRequest {
+            minutes,
+            intensity: get_u8(&query, "intensity", defaults.intensity, 1, 100),
+            count: get_u8(&query, "count", defaults.count, 1, 7),
+            name: query
+                .get("name")
+                .map(|value| decode_query_value(value))
+                .unwrap_or_else(|| "Codex demo".to_string()),
+        };
+        let result = timeout(Duration::from_secs(20), async {
+            client
+                .lock()
+                .await
+                .schedule_vibe_alarm(request, request_started)
+                .await
+        })
+        .await
+        .context("alarm write timed out");
+        return match result {
+            Ok(Ok(mut body)) => {
+                body.timing_ms.request_to_response = Some(ms_since(request_started));
+                write_response(&mut stream, 200, body).await
+            }
+            Ok(Err(error)) | Err(error) => {
+                write_response(
+                    &mut stream,
+                    500,
+                    ErrorBody {
+                        ok: false,
+                        error: error.to_string(),
+                        timing_ms: timing_with_response(request_started),
+                    },
+                )
+                .await
+            }
+        };
+    }
+
+    if method == "POST" && path == "/alarm/wakeup/schedule" {
+        let minutes = get_u16(&query, "minutes", 1, 1, 1440);
+        let entries = get_u8(&query, "entries", 6, 1, 6);
+        let intensity = get_u8(&query, "intensity", defaults.intensity, 1, 100);
+        let prefix = query
+            .get("name")
+            .map(|value| decode_query_value(value))
+            .unwrap_or_else(|| "Wake".to_string());
+        let alarms = wakeup_alarm_entries(minutes, entries, intensity, &prefix, true)?;
+        let state = WakeupAlarmState {
+            profile: WAKEUP_ALARM_PROFILE.to_string(),
+            alarms: alarms.iter().map(AlarmEntry::record).collect(),
+        };
+        let result = timeout(Duration::from_secs(30), async {
+            client
+                .lock()
+                .await
+                .write_alarm_entries("schedule", WAKEUP_ALARM_PROFILE, &alarms, request_started)
+                .await
+        })
+        .await
+        .context("wake-up alarm write timed out");
+        return match result {
+            Ok(Ok(mut body)) => {
+                body.timing_ms.request_to_response = Some(ms_since(request_started));
+                match save_wakeup_alarm_state(&state) {
+                    Ok(()) => write_response(&mut stream, 200, body).await,
+                    Err(error) => {
+                        write_response(
+                            &mut stream,
+                            500,
+                            ErrorBody {
+                                ok: false,
+                                error: error.to_string(),
+                                timing_ms: timing_with_response(request_started),
+                            },
+                        )
+                        .await
+                    }
+                }
+            }
+            Ok(Err(error)) | Err(error) => {
+                write_response(
+                    &mut stream,
+                    500,
+                    ErrorBody {
+                        ok: false,
+                        error: error.to_string(),
+                        timing_ms: timing_with_response(request_started),
+                    },
+                )
+                .await
+            }
+        };
+    }
+
+    if method == "POST" && path == "/alarm/wakeup/cancel" {
+        let state = match load_wakeup_alarm_state() {
+            Ok(Some(state)) => state,
+            Ok(None) => WakeupAlarmState {
+                profile: WAKEUP_ALARM_PROFILE.to_string(),
+                alarms: wakeup_alarm_entries(
+                    get_u16(&query, "minutes", 1, 1, 1440),
+                    get_u8(&query, "entries", 6, 1, 6),
+                    get_u8(&query, "intensity", defaults.intensity, 1, 100),
+                    "Wake",
+                    true,
+                )?
+                .iter()
+                .map(AlarmEntry::record)
+                .collect(),
+            },
             Err(error) => {
+                return write_response(
+                    &mut stream,
+                    500,
+                    ErrorBody {
+                        ok: false,
+                        error: error.to_string(),
+                        timing_ms: timing_with_response(request_started),
+                    },
+                )
+                .await;
+            }
+        };
+        let disabled = state
+            .alarms
+            .iter()
+            .map(|alarm| AlarmEntry {
+                name: alarm.name.clone(),
+                stim: alarm.stim,
+                hour: alarm.scheduled_hour,
+                minute: alarm.scheduled_minute,
+                alarm_id: alarm.alarm_id,
+                intensity: alarm.intensity,
+                count: alarm.count,
+                active: false,
+            })
+            .collect::<Vec<_>>();
+        let result = timeout(Duration::from_secs(30), async {
+            client
+                .lock()
+                .await
+                .write_alarm_entries("cancel", &state.profile, &disabled, request_started)
+                .await
+        })
+        .await
+        .context("wake-up alarm cancel timed out");
+        return match result {
+            Ok(Ok(mut body)) => {
+                body.timing_ms.request_to_response = Some(ms_since(request_started));
+                remove_wakeup_alarm_state().ok();
+                write_response(&mut stream, 200, body).await
+            }
+            Ok(Err(error)) | Err(error) => {
                 write_response(
                     &mut stream,
                     500,
@@ -920,7 +1385,7 @@ async fn handle_http(
             ErrorBody {
                 ok: false,
                 error:
-                    "use POST /api/v5/stimulus/send, /stim/vibe, /stim/beep, or /webtool/testVibe"
+                    "use POST /api/v5/stimulus/send, /stim/vibe, /stim/beep, /alarm/vibe, /alarm/wakeup/schedule, /alarm/wakeup/cancel, or /webtool/testVibe"
                         .to_string(),
                 timing_ms: timing_with_response(request_started),
             },
@@ -944,13 +1409,17 @@ async fn handle_http(
         }
     };
     let request = request_from_query(stim, &query, &defaults);
-    let result = client.lock().await.send(request, request_started).await;
+    let result = timeout(HTTP_ACTION_TIMEOUT, async {
+        client.lock().await.send(request, request_started).await
+    })
+    .await
+    .context("stimulus request timed out");
     match result {
-        Ok(mut body) => {
+        Ok(Ok(mut body)) => {
             body.timing_ms.request_to_response = Some(ms_since(request_started));
             write_response(&mut stream, 200, body).await
         }
-        Err(error) => {
+        Ok(Err(error)) | Err(error) => {
             write_response(
                 &mut stream,
                 500,
@@ -977,6 +1446,7 @@ async fn write_response<T: Serialize>(stream: &mut TcpStream, status: u16, body:
         .await
         .context("write HTTP header")?;
     stream.write_all(&body).await.context("write HTTP body")?;
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
@@ -1001,6 +1471,367 @@ async fn run_stdin(args: CommonArgs, client: PavlokClient) -> Result<()> {
     Ok(())
 }
 
+struct ScreenTimeThresholdMonitor {
+    last_checked_minute: Option<String>,
+    window_label: Option<String>,
+    last_fired_minutes: HashMap<&'static str, u64>,
+}
+
+impl ScreenTimeThresholdMonitor {
+    fn new() -> Self {
+        Self {
+            last_checked_minute: None,
+            window_label: None,
+            last_fired_minutes: HashMap::new(),
+        }
+    }
+}
+
+struct ViolationZapCounters {
+    path: Option<PathBuf>,
+    state: ViolationZapCounterState,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct ViolationZapCounterState {
+    window_label: Option<String>,
+    counts: HashMap<String, u64>,
+}
+
+impl ViolationZapCounters {
+    fn new() -> Self {
+        let path = violation_zap_counts_path();
+        let state = path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default();
+        Self { path, state }
+    }
+
+    fn next_count(&mut self, key: &str) -> Result<u64> {
+        let window = current_screen_time_window()?;
+        let count = self.next_count_for_window(key, &window.window_label);
+        self.save().context("save violation zap counts")?;
+        Ok(count)
+    }
+
+    fn next_count_for_window(&mut self, key: &str, window_label: &str) -> u64 {
+        if self.state.window_label.as_deref() != Some(window_label) {
+            self.state.window_label = Some(window_label.to_string());
+            self.state.counts.clear();
+        }
+
+        let count = self.state.counts.entry(key.to_string()).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    fn save(&self) -> Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        let contents =
+            serde_json::to_string_pretty(&self.state).context("serialize violation zap counts")?;
+        std::fs::write(path, format!("{contents}\n"))
+            .with_context(|| format!("write {}", path.display()))
+    }
+}
+
+fn violation_zap_counts_path() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && !matches!(home.to_str(), Some("") | Some("/") | Some("/var/empty"))
+    {
+        return Some(home.join(".config/pavlov/violation-counts.json"));
+    }
+
+    let username = run_command("/usr/bin/id", &["-un"]).ok()?;
+    Some(PathBuf::from(format!(
+        "/Users/{username}/.config/pavlov/violation-counts.json"
+    )))
+}
+
+fn wakeup_alarm_state_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && !matches!(home.to_str(), Some("") | Some("/") | Some("/var/empty"))
+    {
+        return home.join(".config/pavlov/wakeup-alarms.json");
+    }
+
+    let username = run_command("/usr/bin/id", &["-un"]).unwrap_or_else(|_| "andrewzabelo".into());
+    PathBuf::from(format!(
+        "/Users/{username}/.config/pavlov/wakeup-alarms.json"
+    ))
+}
+
+fn save_wakeup_alarm_state(state: &WakeupAlarmState) -> Result<()> {
+    let path = wakeup_alarm_state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let contents = serde_json::to_string_pretty(state).context("serialize wake-up alarm state")?;
+    std::fs::write(&path, format!("{contents}\n"))
+        .with_context(|| format!("write {}", path.display()))
+}
+
+fn load_wakeup_alarm_state() -> Result<Option<WakeupAlarmState>> {
+    let path = wakeup_alarm_state_path();
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .with_context(|| format!("parse {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn remove_wakeup_alarm_state() -> Result<()> {
+    let path = wakeup_alarm_state_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+struct ScreenTimeThresholdEvent {
+    app_name: &'static str,
+    usage_key: &'static str,
+    total_seconds: u64,
+    threshold_minutes: u64,
+}
+
+struct ScreenTimeWindow {
+    minute_label: String,
+    window_label: String,
+    apple_reference_start: i64,
+}
+
+fn current_screen_time_window() -> Result<ScreenTimeWindow> {
+    let minute_label = run_command("/bin/date", &["+%Y-%m-%d %H:%M"])
+        .context("read current local minute for screen time")?;
+    let window_label = run_command("/bin/sh", &["-c", "if [ \"$(/bin/date +%H)\" -lt 5 ]; then /bin/date -v-1d +%Y-%m-%d; else /bin/date +%Y-%m-%d; fi"])
+        .context("read screen time window label")?;
+    let unix_start = run_command(
+        "/bin/sh",
+        &[
+            "-c",
+            "if [ \"$(/bin/date +%H)\" -lt 5 ]; then /bin/date -v-1d -v5H -v0M -v0S +%s; else /bin/date -v5H -v0M -v0S +%s; fi",
+        ],
+    )
+    .context("read screen time window start")?
+    .parse::<i64>()
+    .context("parse screen time window start seconds")?;
+    Ok(ScreenTimeWindow {
+        minute_label,
+        window_label,
+        apple_reference_start: unix_start - 978_307_200,
+    })
+}
+
+fn screen_time_seconds_since(window: &ScreenTimeWindow, bundle_id: &str) -> Result<u64> {
+    let query = format!(
+        "select coalesce(sum(case when ZENDDATE > {start} then ZENDDATE - max(ZSTARTDATE, {start}) else 0 end), 0) from ZOBJECT where ZSTREAMNAME='/app/usage' and ZVALUESTRING='{bundle}' and ZENDDATE > {start};",
+        start = window.apple_reference_start,
+        bundle = bundle_id.replace('\'', "''"),
+    );
+    let output = run_command(
+        "/usr/bin/sqlite3",
+        &["-readonly", screen_time_db_path(), &query],
+    )
+    .with_context(|| format!("query screen time usage for {bundle_id}"))?;
+    let seconds = output.trim().parse::<f64>().unwrap_or(0.0).max(0.0);
+    Ok(seconds.floor() as u64)
+}
+
+fn screen_time_youtube_seconds_since(window: &ScreenTimeWindow) -> Result<u64> {
+    let query = format!(
+        "\
+select coalesce(sum(case when o.ZENDDATE > {start} then o.ZENDDATE - max(o.ZSTARTDATE, {start}) else 0 end), 0) \
+from ZOBJECT o \
+left join ZSTRUCTUREDMETADATA m on o.ZSTRUCTUREDMETADATA = m.Z_PK \
+where o.ZSTREAMNAME = '/app/webUsage' \
+and o.ZENDDATE > {start} \
+and {youtube_filter};",
+        start = window.apple_reference_start,
+        youtube_filter = youtube_screen_time_sql_filter(),
+    );
+    let output = run_command(
+        "/usr/bin/sqlite3",
+        &["-readonly", screen_time_db_path(), &query],
+    )
+    .context("query screen time usage for YouTube web domains")?;
+    let seconds = output.trim().parse::<f64>().unwrap_or(0.0).max(0.0);
+    Ok(seconds.floor() as u64)
+}
+
+fn youtube_screen_time_sql_filter() -> &'static str {
+    "\
+(lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBDOMAIN, '')) = 'youtube.com' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBDOMAIN, '')) like '%.youtube.com' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBDOMAIN, '')) = 'youtu.be' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBDOMAIN, '')) like '%.youtu.be' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBPAGEURL, '')) like '%://youtube.com/%' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBPAGEURL, '')) like '%://www.youtube.com/%' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBPAGEURL, '')) like '%://m.youtube.com/%' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBPAGEURL, '')) like '%://music.youtube.com/%' \
+or lower(coalesce(m.Z_DKDIGITALHEALTHMETADATAKEY__WEBPAGEURL, '')) like '%://youtu.be/%')"
+}
+
+fn screen_time_threshold_minutes(total_seconds: u64) -> Option<u64> {
+    if total_seconds < 20 * 60 {
+        None
+    } else {
+        Some(20 + ((total_seconds - 20 * 60) / (5 * 60)) * 5)
+    }
+}
+
+fn screen_time_db_path() -> &'static str {
+    "/Users/andrewzabelo/Library/Application Support/Knowledge/knowledgeC.db"
+}
+
+fn check_screen_time_thresholds(
+    monitor: &mut ScreenTimeThresholdMonitor,
+) -> Result<Vec<ScreenTimeThresholdEvent>> {
+    let window = current_screen_time_window()?;
+    if monitor.last_checked_minute.as_deref() == Some(window.minute_label.as_str()) {
+        return Ok(Vec::new());
+    }
+    monitor.last_checked_minute = Some(window.minute_label.clone());
+    if monitor.window_label.as_deref() != Some(window.window_label.as_str()) {
+        monitor.window_label = Some(window.window_label.clone());
+        monitor.last_fired_minutes.clear();
+    }
+
+    let mut events = Vec::new();
+    for usage in [
+        ("Messages", "com.apple.MobileSMS"),
+        ("Outlook", "com.microsoft.Outlook"),
+    ]
+    .into_iter()
+    .map(|(app_name, bundle_id)| {
+        screen_time_seconds_since(&window, bundle_id).map(|seconds| (app_name, bundle_id, seconds))
+    })
+    .chain(std::iter::once(
+        screen_time_youtube_seconds_since(&window)
+            .map(|seconds| ("YouTube", "web:youtube", seconds)),
+    )) {
+        let (app_name, usage_key, total_seconds) = usage?;
+        let Some(threshold_minutes) = screen_time_threshold_minutes(total_seconds) else {
+            continue;
+        };
+        let last_fired = monitor
+            .last_fired_minutes
+            .get(usage_key)
+            .copied()
+            .unwrap_or(0);
+        if threshold_minutes > last_fired {
+            monitor
+                .last_fired_minutes
+                .insert(usage_key, threshold_minutes);
+            events.push(ScreenTimeThresholdEvent {
+                app_name,
+                usage_key,
+                total_seconds,
+                threshold_minutes,
+            });
+        }
+    }
+    Ok(events)
+}
+
+async fn emit_monitor_zap(
+    args: &MonitorArgs,
+    client: Option<&PavlokClient>,
+    signal_name: &str,
+    reason: &str,
+    zap_count: u64,
+    context: serde_json::Value,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "ok": true,
+        "signal": signal_name,
+        "reason": reason,
+        "dry_run": args.dry_run,
+        "zap_count": zap_count,
+        "context": context,
+    });
+    print_json(&body)?;
+
+    if let Some(client) = client {
+        for zap_index in 1..=zap_count {
+            match client
+                .send(default_request(&args.common, Stimulus::Zap), Instant::now())
+                .await
+            {
+                Ok(body) => {
+                    let notification_requested = notify_zap_sent(reason);
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "stim": body.stim,
+                        "mode": body.mode,
+                        "payload_hex": body.payload_hex,
+                        "timing_ms": body.timing_ms,
+                        "notification_requested": notification_requested,
+                        "zap_index": zap_index,
+                        "zap_count": zap_count,
+                    }))?
+                }
+                Err(error) => {
+                    print_json(&serde_json::json!({
+                        "ok": false,
+                        "signal": signal_name,
+                        "error": error.to_string(),
+                        "zap_index": zap_index,
+                        "zap_count": zap_count,
+                    }))?;
+                }
+            }
+            sleep_between_monitor_zaps(zap_index, zap_count).await;
+        }
+    } else if !args.dry_run {
+        for zap_index in 1..=zap_count {
+            match send_zap_http(&args.zap_url, &args.common).await {
+                Ok(response) => {
+                    let notification_requested = notify_zap_sent(reason);
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "stim": "zap",
+                        "via": "http",
+                        "zap_url": args.zap_url,
+                        "response": response,
+                        "notification_requested": notification_requested,
+                        "zap_index": zap_index,
+                        "zap_count": zap_count,
+                    }))?
+                }
+                Err(error) => print_json(&serde_json::json!({
+                    "ok": false,
+                    "stim": "zap",
+                    "via": "http",
+                    "zap_url": args.zap_url,
+                    "error": error.to_string(),
+                    "zap_index": zap_index,
+                    "zap_count": zap_count,
+                }))?,
+            }
+            sleep_between_monitor_zaps(zap_index, zap_count).await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn sleep_between_monitor_zaps(zap_index: u64, zap_count: u64) {
+    if zap_index < zap_count {
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 async fn run_monitor(
     args: MonitorArgs,
     client: Option<PavlokClient>,
@@ -1008,6 +1839,10 @@ async fn run_monitor(
 ) -> Result<()> {
     let mut cooldowns = SignalCooldowns::new(Duration::from_secs(args.cooldown_secs));
     let mut warnings_seen = std::collections::HashSet::new();
+    let mut screen_time_monitor = ScreenTimeThresholdMonitor::new();
+    let mut violation_zap_counters = ViolationZapCounters::new();
+    let mut active_one_shot_violations = std::collections::HashSet::new();
+    let mut suppress_initial_one_shot_violations = true;
     loop {
         let (snapshot, warnings) = signals::read_snapshot(args.dnd_command.as_deref());
         for warning in warnings {
@@ -1016,69 +1851,79 @@ async fn run_monitor(
             }
         }
 
+        let mut current_one_shot_violations = std::collections::HashSet::new();
         for violation in config.violations(&snapshot) {
+            if let Some(one_shot_key) = violation.one_shot_key() {
+                current_one_shot_violations.insert(one_shot_key.to_string());
+                if suppress_initial_one_shot_violations {
+                    active_one_shot_violations.insert(one_shot_key.to_string());
+                    continue;
+                }
+                if active_one_shot_violations.contains(one_shot_key) {
+                    continue;
+                }
+                active_one_shot_violations.insert(one_shot_key.to_string());
+            }
             if !cooldowns.ready(violation.cooldown_key(), Instant::now()) {
                 continue;
             }
             let reason = signal_notification_reason(&violation);
+            let counter_key = violation.cooldown_key();
+            let zap_count = violation_zap_counters.next_count(&counter_key)?;
+            emit_monitor_zap(
+                &args,
+                client.as_ref(),
+                violation.signal_name(),
+                &reason,
+                zap_count,
+                serde_json::json!({
+                    "rule": violation.rule,
+                    "frontmost_app": snapshot.frontmost_app,
+                    "browser_url": snapshot.browser_url,
+                    "browser_title": snapshot.browser_title,
+                    "dnd_enabled": snapshot.dnd_enabled,
+                    "source": violation.source,
+                    "violation_count_key": counter_key,
+                    "violation_count_since_5am": zap_count,
+                }),
+            )
+            .await?;
+        }
+        active_one_shot_violations.retain(|key| current_one_shot_violations.contains(key));
+        suppress_initial_one_shot_violations = false;
 
-            let body = serde_json::json!({
-                "ok": true,
-                "signal": violation.signal_name(),
-                "rule": violation.rule,
-                "reason": reason,
-                "frontmost_app": snapshot.frontmost_app,
-                "browser_url": snapshot.browser_url,
-                "browser_title": snapshot.browser_title,
-                "dnd_enabled": snapshot.dnd_enabled,
-                "dry_run": args.dry_run,
-            });
-            print_json(&body)?;
-
-            if let Some(client) = &client {
-                match client
-                    .send(default_request(&args.common, Stimulus::Zap), Instant::now())
-                    .await
-                {
-                    Ok(body) => {
-                        let notification_requested = notify_zap_sent(&reason);
-                        print_json(&serde_json::json!({
-                            "ok": true,
-                            "stim": body.stim,
-                            "mode": body.mode,
-                            "payload_hex": body.payload_hex,
-                            "timing_ms": body.timing_ms,
-                            "notification_requested": notification_requested,
-                        }))?
-                    }
-                    Err(error) => {
-                        print_json(&serde_json::json!({
-                            "ok": false,
-                            "signal": violation.signal_name(),
-                            "error": error.to_string(),
-                        }))?;
-                    }
+        match check_screen_time_thresholds(&mut screen_time_monitor) {
+            Ok(events) => {
+                for event in events {
+                    let reason = format!(
+                        "{} Screen Time reached {} minutes since 5:00 AM",
+                        event.app_name, event.threshold_minutes
+                    );
+                    let counter_key = format!("screen-time:{}", event.usage_key);
+                    let zap_count = violation_zap_counters.next_count(&counter_key)?;
+                    emit_monitor_zap(
+                        &args,
+                        client.as_ref(),
+                        "screen_time_threshold",
+                        &reason,
+                        zap_count,
+                        serde_json::json!({
+                            "app_name": event.app_name,
+                            "usage_key": event.usage_key,
+                            "threshold_minutes": event.threshold_minutes,
+                            "total_seconds": event.total_seconds,
+                            "window_starts_at": "05:00",
+                            "violation_count_key": counter_key,
+                            "violation_count_since_5am": zap_count,
+                        }),
+                    )
+                    .await?;
                 }
-            } else if !args.dry_run {
-                match send_zap_http(&args.zap_url, &args.common).await {
-                    Ok(response) => {
-                        let notification_requested = notify_zap_sent(&reason);
-                        print_json(&serde_json::json!({
-                            "ok": true,
-                            "stim": "zap",
-                            "via": "http",
-                            "zap_url": args.zap_url,
-                            "response": response,
-                            "notification_requested": notification_requested,
-                        }))?
-                    }
-                    Err(error) => print_json(&serde_json::json!({
-                        "ok": false,
-                        "stim": "zap",
-                        "via": "http",
-                        "zap_url": args.zap_url,
-                        "error": error.to_string(),
-                    }))?,
+            }
+            Err(error) => {
+                let warning = format!("screen time query failed: {error}");
+                if warnings_seen.insert(warning.clone()) {
+                    eprintln!("monitor warning: {warning}");
                 }
             }
         }
@@ -1105,6 +1950,17 @@ fn signal_notification_reason(violation: &signals::SignalViolation<'_>) -> Strin
             )
         }
     }
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("run {program}"))?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn notify_zap_sent(reason: &str) -> bool {
@@ -1475,6 +2331,266 @@ fn payload_for(request: &StimRequest) -> Vec<u8> {
     }
 }
 
+struct LocalDateParts {
+    second: u8,
+    minute: u8,
+    hour: u8,
+    day: u8,
+    weekday: u8,
+    month: u8,
+    year: u8,
+    tz_quarter_hours: i8,
+}
+
+struct AlarmTime {
+    hour: u8,
+    minute: u8,
+}
+
+fn local_date_parts(minute_offset: u16) -> Result<LocalDateParts> {
+    let mut command = std::process::Command::new("/bin/date");
+    if minute_offset > 0 {
+        command.arg(format!("-v+{minute_offset}M"));
+    }
+    let output = command
+        .arg("+%S %M %H %d %w %m %y %z")
+        .output()
+        .context("run /bin/date")?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parts = stdout.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 8 {
+        bail!("unexpected /bin/date output: {stdout:?}");
+    }
+    let tz = parts[7];
+    let sign = if tz.starts_with('-') { -1 } else { 1 };
+    let tz_hours = tz
+        .get(1..3)
+        .ok_or_else(|| anyhow!("invalid timezone offset: {tz}"))?
+        .parse::<i8>()
+        .with_context(|| format!("parse timezone hours from {tz}"))?;
+    let tz_minutes = tz
+        .get(3..5)
+        .ok_or_else(|| anyhow!("invalid timezone offset: {tz}"))?
+        .parse::<i8>()
+        .with_context(|| format!("parse timezone minutes from {tz}"))?;
+    Ok(LocalDateParts {
+        second: parse_date_u8(parts[0], "second")?,
+        minute: parse_date_u8(parts[1], "minute")?,
+        hour: parse_date_u8(parts[2], "hour")?,
+        day: parse_date_u8(parts[3], "day")?,
+        weekday: parse_date_u8(parts[4], "weekday")?,
+        month: parse_date_u8(parts[5], "month")?,
+        year: parse_date_u8(parts[6], "year")?,
+        tz_quarter_hours: sign * (tz_hours * 4 + tz_minutes / 15),
+    })
+}
+
+fn local_alarm_time(minute_offset: u16) -> Result<AlarmTime> {
+    let parts = local_date_parts(minute_offset)?;
+    Ok(AlarmTime {
+        hour: parts.hour,
+        minute: parts.minute,
+    })
+}
+
+fn parse_date_u8(value: &str, label: &str) -> Result<u8> {
+    value
+        .parse::<u8>()
+        .with_context(|| format!("parse {label} from {value:?}"))
+}
+
+fn pavlok_time_payload(parts: &LocalDateParts) -> Vec<u8> {
+    vec![
+        decimal_to_bcd(parts.second),
+        decimal_to_bcd(parts.minute),
+        decimal_to_bcd(parts.hour),
+        decimal_to_bcd(parts.day),
+        decimal_to_bcd(parts.weekday),
+        decimal_to_bcd(parts.month),
+        decimal_to_bcd(parts.year),
+        parts.tz_quarter_hours as u8,
+    ]
+}
+
+fn alarm_id_from_time(parts: &LocalDateParts) -> u16 {
+    let seed = parts.hour as u16 * 60 + parts.minute as u16 + parts.second as u16;
+    seed % 4095 + 1
+}
+
+fn wakeup_alarm_entries(
+    start_minutes: u16,
+    entries: u8,
+    intensity: u8,
+    name_prefix: &str,
+    active: bool,
+) -> Result<Vec<AlarmEntry>> {
+    (0..entries)
+        .map(|index| {
+            let alarm_time = local_alarm_time(start_minutes + index as u16)
+                .with_context(|| format!("read wake-up alarm time #{index}"))?;
+            Ok(AlarmEntry {
+                name: format!("{name_prefix} {}", index + 1),
+                stim: Stimulus::Zap,
+                hour: alarm_time.hour,
+                minute: alarm_time.minute,
+                alarm_id: WAKEUP_ALARM_ID_BASE + index as u16,
+                intensity,
+                count: index + 1,
+                active,
+            })
+        })
+        .collect()
+}
+
+fn build_alarm_file(profile: &str, entries: &[AlarmEntry]) -> Vec<u8> {
+    let mut body_parts = Vec::with_capacity(1 + entries.len());
+    body_parts.push(build_tlv("AP", profile.as_bytes()));
+    for entry in entries {
+        body_parts.push(build_tlv("HA", &build_alarm_entry(entry)));
+    }
+    let body = concat_bytes(&body_parts);
+    let mut payload = Vec::with_capacity(6 + body.len());
+    payload.extend_from_slice(b"AH");
+    payload.extend_from_slice(&((body.len() + 2) as u16).to_le_bytes());
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&body);
+    let crc = crc_ccitt(&payload, 0xffff);
+    payload[4..6].copy_from_slice(&crc.to_le_bytes());
+    payload
+}
+
+fn build_alarm_entry(entry: &AlarmEntry) -> Vec<u8> {
+    concat_bytes(&[
+        build_tlv("AN", entry.name.as_bytes()),
+        build_tlv(
+            "TM",
+            &[
+                0,
+                decimal_to_bcd(entry.minute),
+                decimal_to_bcd(entry.hour),
+                if entry.active { 0x80 } else { 0 },
+            ],
+        ),
+        build_tlv("WD", &[1]),
+        build_tlv("WI", &120u16.to_le_bytes()),
+        build_tlv("SN", &[0]),
+        build_tlv("AO", &[u8::from(entry.active)]),
+        build_tlv("ID", &(entry.alarm_id % 4096).to_le_bytes()),
+        build_alarm_stim(entry.stim, entry.intensity, entry.count),
+    ])
+}
+
+fn build_alarm_stim(stim: Stimulus, intensity: u8, count: u8) -> Vec<u8> {
+    match stim {
+        Stimulus::Vibe => build_vibe_stim(intensity, count),
+        Stimulus::Beep => build_beep_stim(intensity, count),
+        Stimulus::Zap => build_zap_stim(intensity, count),
+    }
+}
+
+fn build_vibe_stim(intensity: u8, count: u8) -> Vec<u8> {
+    let motor_command = [
+        b'M',
+        b'C',
+        5,
+        0,
+        0x80 | count.clamp(1, 7),
+        12,
+        intensity.clamp(1, 100),
+        250,
+        250,
+    ];
+    build_tlv("MH", &motor_command)
+}
+
+fn build_beep_stim(intensity: u8, count: u8) -> Vec<u8> {
+    let beep_command = [
+        b'P',
+        b'C',
+        5,
+        0,
+        0x80 | count.clamp(1, 7),
+        0,
+        intensity.clamp(1, 100),
+        250,
+        250,
+    ];
+    build_tlv("PH", &beep_command)
+}
+
+fn build_zap_stim(intensity: u8, count: u8) -> Vec<u8> {
+    let zap_command = [
+        b'Z',
+        b'C',
+        2,
+        0,
+        0x80 | count.clamp(1, 7),
+        intensity.clamp(1, 100),
+    ];
+    build_tlv("ZH", &zap_command)
+}
+
+fn build_tlv(tag: &str, value: &[u8]) -> Vec<u8> {
+    let bytes = tag.as_bytes();
+    let mut output = Vec::with_capacity(4 + value.len());
+    output.extend_from_slice(&bytes[..2]);
+    output.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    output.extend_from_slice(value);
+    output
+}
+
+fn concat_bytes(chunks: &[Vec<u8>]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+    for chunk in chunks {
+        output.extend_from_slice(chunk);
+    }
+    output
+}
+
+fn decimal_to_bcd(value: u8) -> u8 {
+    (value / 10) << 4 | (value % 10)
+}
+
+fn bcd_to_decimal(value: u8) -> u8 {
+    10 * (value >> 4) + (value & 0x0f)
+}
+
+fn crc_ccitt(bytes: &[u8], initial: u16) -> u16 {
+    let mut crc = initial;
+    for byte in bytes {
+        crc ^= (*byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn parse_next_alarm(payload: &[u8]) -> Option<String> {
+    if payload.len() < 7 {
+        return None;
+    }
+    let minute = bcd_to_decimal(payload[1]);
+    let hour = bcd_to_decimal(payload[2]);
+    let weekday = payload[4] as usize;
+    let id = u16::from_le_bytes([payload[5], payload[6]]);
+    if id == 0 {
+        return Some("none".to_string());
+    }
+    let day = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        .get(weekday)
+        .copied()
+        .unwrap_or("?");
+    Some(format!("{day} {hour:02}:{minute:02} (id #{id})"))
+}
+
 fn parse_target(target: &str) -> (String, HashMap<String, String>) {
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
     let query = raw_query
@@ -1507,6 +2623,29 @@ fn get_u32(query: &HashMap<String, String>, key: &str, default: u32) -> u32 {
         .get(key)
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(default)
+}
+
+fn decode_query_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'+' {
+            output.push(b' ');
+            index += 1;
+        } else if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            output.push(byte);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
 }
 
 fn get_usize(
@@ -1638,6 +2777,55 @@ unsafe fn libc_dup2(from: i32, to: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn violation_zap_counts_reset_at_new_5am_window() {
+        let mut counters = ViolationZapCounters {
+            path: None,
+            state: ViolationZapCounterState::default(),
+        };
+
+        assert_eq!(
+            counters.next_count_for_window("app:dnd:messages", "2026-05-12"),
+            1
+        );
+        assert_eq!(
+            counters.next_count_for_window("app:dnd:messages", "2026-05-12"),
+            2
+        );
+        assert_eq!(
+            counters.next_count_for_window("app:dnd:outlook", "2026-05-12"),
+            1
+        );
+        assert_eq!(
+            counters.next_count_for_window("app:dnd:messages", "2026-05-13"),
+            1
+        );
+    }
+
+    #[test]
+    fn zap_alarm_stimulus_encodes_count_and_interval() {
+        let payload = build_zap_stim(50, 2);
+        assert_eq!(payload, vec![b'Z', b'H', 6, 0, b'Z', b'C', 2, 0, 0x82, 50]);
+    }
+
+    #[test]
+    fn inactive_alarm_clears_time_active_bit() {
+        let entry = AlarmEntry {
+            name: "Wake".to_string(),
+            stim: Stimulus::Zap,
+            hour: 9,
+            minute: 5,
+            alarm_id: 905,
+            intensity: 50,
+            count: 1,
+            active: false,
+        };
+
+        let payload = build_alarm_entry(&entry);
+        let time = build_tlv("TM", &[0, decimal_to_bcd(5), decimal_to_bcd(9), 0]);
+        assert!(payload.windows(time.len()).any(|window| window == time));
+    }
 
     #[test]
     fn payloads_match_protocol_bytes() {
@@ -1896,6 +3084,30 @@ mod tests {
         };
 
         assert_eq!(sample_latency_ms(&timing), 9.5);
+    }
+
+    #[test]
+    fn screen_time_thresholds_start_at_twenty_minutes_then_every_five() {
+        assert_eq!(screen_time_threshold_minutes(19 * 60 + 59), None);
+        assert_eq!(screen_time_threshold_minutes(20 * 60), Some(20));
+        assert_eq!(screen_time_threshold_minutes(24 * 60 + 59), Some(20));
+        assert_eq!(screen_time_threshold_minutes(25 * 60), Some(25));
+        assert_eq!(screen_time_threshold_minutes(30 * 60), Some(30));
+    }
+
+    #[test]
+    fn youtube_screen_time_filter_matches_domains_and_urls() {
+        let filter = youtube_screen_time_sql_filter();
+        assert!(filter.contains("WEBDOMAIN"));
+        assert!(filter.contains("youtube.com"));
+        assert!(filter.contains("youtu.be"));
+        assert!(filter.contains("WEBPAGEURL"));
+    }
+
+    #[test]
+    fn decodes_url_encoded_alarm_names() {
+        assert_eq!(decode_query_value("Codex%20demo"), "Codex demo");
+        assert_eq!(decode_query_value("Outlook+limit"), "Outlook limit");
     }
 
     fn webtool_writes(command: WebtoolCommand) -> Vec<(StimulusKey, Vec<u8>)> {
