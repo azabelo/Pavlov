@@ -88,7 +88,12 @@ impl Default for SignalConfig {
                 SignalRule {
                     kind: SignalRuleKind::Website,
                     scope: RuleScope::Always,
-                    pattern: "youtube".to_string(),
+                    pattern: "youtube-homepage".to_string(),
+                },
+                SignalRule {
+                    kind: SignalRuleKind::Website,
+                    scope: RuleScope::Always,
+                    pattern: "linkedin".to_string(),
                 },
             ],
         }
@@ -154,38 +159,64 @@ impl SignalConfig {
         self.rules
             .iter()
             .filter(|rule| rule.scope == RuleScope::Always || snapshot.dnd_enabled)
-            .filter(|rule| match rule.kind {
+            .filter_map(|rule| match rule.kind {
                 SignalRuleKind::App => snapshot
                     .frontmost_app
                     .as_deref()
-                    .is_some_and(|app| contains_folded(app, &rule.pattern)),
+                    .is_some_and(|app| contains_folded(app, &rule.pattern))
+                    .then(|| SignalViolation {
+                        rule,
+                        source: "frontmost-app".to_string(),
+                        one_shot_key: None,
+                    }),
                 SignalRuleKind::Website => {
-                    snapshot
+                    let local_browser_match = snapshot
                         .browser_url
                         .as_deref()
-                        .is_some_and(|url| contains_folded(url, &rule.pattern))
+                        .is_some_and(|url| matches_website_url(url, &rule.pattern))
                         || snapshot
                             .browser_title
                             .as_deref()
-                            .is_some_and(|title| contains_folded(title, &rule.pattern))
+                            .is_some_and(|title| matches_website_title(title, &rule.pattern))
                         || snapshot.open_browser_tabs.iter().any(|tab| {
                             tab.url
                                 .as_deref()
-                                .is_some_and(|url| contains_folded(url, &rule.pattern))
-                                || tab
-                                    .title
-                                    .as_deref()
-                                    .is_some_and(|title| contains_folded(title, &rule.pattern))
+                                .is_some_and(|url| matches_website_url(url, &rule.pattern))
+                                || tab.title.as_deref().is_some_and(|title| {
+                                    matches_website_title(title, &rule.pattern)
+                                })
+                        });
+                    if local_browser_match {
+                        Some(SignalViolation {
+                            rule,
+                            source: "local-browser".to_string(),
+                            one_shot_key: None,
                         })
+                    } else if is_youtube_homepage_pattern(&rule.pattern) {
+                        snapshot.iphone_safari_tabs.iter().find_map(|tab| {
+                            let url = tab.url.as_deref()?;
+                            is_youtube_homepage_url(url).then(|| SignalViolation {
+                                rule,
+                                source: tab.app.clone(),
+                                one_shot_key: Some(format!(
+                                    "iphone-safari:{}",
+                                    normalized_url_without_query(url)
+                                )),
+                            })
+                        })
+                    } else {
+                        None
+                    }
                 }
             })
-            .map(|rule| SignalViolation { rule })
             .collect()
     }
 }
 
 pub struct SignalViolation<'a> {
     pub rule: &'a SignalRule,
+    pub source: String,
+    pub one_shot_key: Option<String>,
 }
 
 impl SignalViolation<'_> {
@@ -206,6 +237,10 @@ impl SignalViolation<'_> {
             (SignalRuleKind::Website, RuleScope::Dnd) => "disallowed_website_during_dnd",
         }
     }
+
+    pub fn one_shot_key(&self) -> Option<&str> {
+        self.one_shot_key.as_deref()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -214,6 +249,7 @@ pub struct SignalSnapshot {
     pub browser_url: Option<String>,
     pub browser_title: Option<String>,
     pub open_browser_tabs: Vec<BrowserTab>,
+    pub iphone_safari_tabs: Vec<BrowserTab>,
     pub dnd_enabled: bool,
 }
 
@@ -276,6 +312,13 @@ pub fn read_snapshot(dnd_command: Option<&str>) -> (SignalSnapshot, Vec<String>)
             Vec::new()
         }
     };
+    let iphone_safari_tabs = match read_iphone_safari_tabs() {
+        Ok(tabs) => tabs,
+        Err(error) => {
+            warnings.push(format!("iPhone Safari tab detection failed: {error}"));
+            Vec::new()
+        }
+    };
 
     let dnd_enabled = match read_dnd_enabled(dnd_command) {
         Ok(dnd_enabled) => dnd_enabled,
@@ -293,6 +336,7 @@ pub fn read_snapshot(dnd_command: Option<&str>) -> (SignalSnapshot, Vec<String>)
             browser_url: browser.as_ref().and_then(|browser| browser.url.clone()),
             browser_title: browser.and_then(|browser| browser.title),
             open_browser_tabs,
+            iphone_safari_tabs,
             dnd_enabled,
         },
         warnings,
@@ -465,6 +509,48 @@ fn parse_browser_tabs(app: &str, family: BrowserFamily, output: &str) -> Vec<Bro
         .collect()
 }
 
+fn read_iphone_safari_tabs() -> Result<Vec<BrowserTab>> {
+    let Some(home) = current_home_dir() else {
+        return Ok(Vec::new());
+    };
+    let db_path = home.join("Library/Containers/com.apple.Safari/Data/Library/Safari/CloudTabs.db");
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let query = "\
+select d.device_name, t.url, coalesce(t.title, '') \
+from cloud_tabs t \
+join cloud_tab_devices d on d.device_uuid = t.device_uuid \
+where lower(d.device_type_identifier) like '%iphone%';";
+    let output = run_command(
+        "/usr/bin/sqlite3",
+        &["-readonly", path_to_str(&db_path)?, query],
+    )?;
+    Ok(parse_iphone_safari_tabs(&output))
+}
+
+fn parse_iphone_safari_tabs(output: &str) -> Vec<BrowserTab> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let device = non_empty(parts.next()?.to_string())?;
+            let url = non_empty(parts.next()?.to_string());
+            let title = parts.next().and_then(|title| non_empty(title.to_string()));
+            (url.is_some() || title.is_some()).then(|| BrowserTab {
+                app: format!("{device} Safari"),
+                url,
+                title,
+            })
+        })
+        .collect()
+}
+
+fn path_to_str(path: &std::path::Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
+}
+
 fn app_is_running(app: &str) -> bool {
     run_command("/usr/bin/pgrep", &["-x", app]).is_ok()
 }
@@ -496,9 +582,9 @@ fn browser_family(app: &str) -> Option<BrowserFamily> {
     }
 }
 
-fn read_dnd_enabled(dnd_command: Option<&str>) -> Result<bool> {
-    if let Some(command) = dnd_command {
-        return read_dnd_from_command(command);
+fn default_dnd_detection() -> Result<bool> {
+    if let Some(value) = read_dnd_from_assertions()? {
+        return Ok(value);
     }
 
     for args in [
@@ -510,10 +596,10 @@ fn read_dnd_enabled(dnd_command: Option<&str>) -> Result<bool> {
         ][..],
         &["read", "com.apple.notificationcenterui", "doNotDisturb"][..],
     ] {
-        if let Ok(output) = run_command("/usr/bin/defaults", &args) {
-            if let Some(value) = parse_boolish(&output) {
-                return Ok(value);
-            }
+        if let Ok(output) = run_command("/usr/bin/defaults", args)
+            && let Some(value) = parse_boolish(&output)
+        {
+            return Ok(value);
         }
     }
 
@@ -522,6 +608,79 @@ fn read_dnd_enabled(dnd_command: Option<&str>) -> Result<bool> {
     }
 
     bail!("macOS does not expose a stable Focus status API, and no readable fallback worked")
+}
+
+fn read_dnd_from_assertions() -> Result<Option<bool>> {
+    let Some(home) = current_home_dir() else {
+        return Ok(None);
+    };
+    let path = home.join("Library/DoNotDisturb/DB/Assertions.json");
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&contents).with_context(|| format!("parse {}", path.display()))?;
+    Ok(active_dnd_assertion_from_json(&value))
+}
+
+fn active_dnd_assertion_from_json(value: &serde_json::Value) -> Option<bool> {
+    let stores = value.get("data")?.as_array()?;
+    for store in stores {
+        let Some(records) = store
+            .get("storeAssertionRecords")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        if !records.is_empty() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+fn current_home_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && !matches!(home.to_str(), Some("") | Some("/") | Some("/var/empty"))
+    {
+        return Some(home);
+    }
+
+    let username = run_command("/usr/bin/id", &["-un"]).ok()?;
+    let dscl_path = format!("/Users/{username}");
+    let output = run_command(
+        "/usr/bin/dscl",
+        &[".", "-read", &dscl_path, "NFSHomeDirectory"],
+    )
+    .ok()?;
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("NFSHomeDirectory: "))
+        .map(PathBuf::from)
+}
+
+fn read_dnd_enabled(dnd_command: Option<&str>) -> Result<bool> {
+    if let Some(command) = dnd_command {
+        match read_dnd_from_command(command) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {
+                if let Ok(fallback) = default_dnd_detection() {
+                    return Ok(fallback);
+                }
+                return Ok(false);
+            }
+            Err(error) => {
+                if let Ok(fallback) = default_dnd_detection() {
+                    return Ok(fallback);
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    default_dnd_detection()
 }
 
 fn read_dnd_from_command(command: &str) -> Result<bool> {
@@ -655,6 +814,59 @@ fn contains_folded(haystack: &str, needle: &str) -> bool {
         .contains(&needle.to_ascii_lowercase())
 }
 
+fn matches_website_url(url: &str, pattern: &str) -> bool {
+    if is_youtube_homepage_pattern(pattern) {
+        return is_youtube_homepage_url(url);
+    }
+    contains_folded(url, pattern)
+}
+
+fn matches_website_title(title: &str, pattern: &str) -> bool {
+    if is_youtube_homepage_pattern(pattern) {
+        return false;
+    }
+    contains_folded(title, pattern)
+}
+
+fn is_youtube_homepage_pattern(pattern: &str) -> bool {
+    eq_folded(pattern, "youtube-homepage")
+}
+
+fn is_youtube_homepage_url(url: &str) -> bool {
+    let url = url.trim();
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let authority_and_path = without_scheme
+        .split_once('#')
+        .map_or(without_scheme, |(before, _)| before);
+    let authority_and_path = authority_and_path
+        .split_once('?')
+        .map_or(authority_and_path, |(before, _)| before);
+    let (host, path) = authority_and_path
+        .split_once('/')
+        .map_or((authority_and_path, ""), |(host, path)| (host, path));
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    let host = host.to_ascii_lowercase();
+
+    matches!(
+        host.as_str(),
+        "youtube.com" | "www.youtube.com" | "m.youtube.com"
+    ) && (path.is_empty() || path == "/")
+}
+
+fn normalized_url_without_query(url: &str) -> String {
+    let url = url.trim();
+    url.split_once('#')
+        .map_or(url, |(before, _)| before)
+        .split_once('?')
+        .map_or_else(
+            || url.trim_end_matches('/').to_ascii_lowercase(),
+            |(before, _)| before.trim_end_matches('/').to_ascii_lowercase(),
+        )
+}
+
 fn eq_folded(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -687,7 +899,36 @@ mod tests {
 
         assert!(rules.contains(&(SignalRuleKind::App, RuleScope::Dnd, "Messages")));
         assert!(rules.contains(&(SignalRuleKind::App, RuleScope::Dnd, "Outlook")));
-        assert!(rules.contains(&(SignalRuleKind::Website, RuleScope::Always, "youtube")));
+        assert!(rules.contains(&(
+            SignalRuleKind::Website,
+            RuleScope::Always,
+            "youtube-homepage"
+        )));
+        assert!(rules.contains(&(SignalRuleKind::Website, RuleScope::Always, "linkedin")));
+    }
+
+    #[test]
+    fn detects_active_dnd_assertions_store() {
+        let active = serde_json::json!({
+            "data": [{
+                "storeAssertionRecords": [{
+                    "assertionDetails": {
+                        "assertionDetailsModeIdentifier": "com.apple.donotdisturb.mode.default"
+                    }
+                }]
+            }]
+        });
+        assert_eq!(active_dnd_assertion_from_json(&active), Some(true));
+
+        let inactive = serde_json::json!({
+            "data": [{
+                "storeAssertionRecords": []
+            }]
+        });
+        assert_eq!(active_dnd_assertion_from_json(&inactive), Some(false));
+
+        let unavailable = serde_json::json!({ "header": { "version": 8 } });
+        assert_eq!(active_dnd_assertion_from_json(&unavailable), None);
     }
 
     #[test]
@@ -708,13 +949,63 @@ mod tests {
         };
         assert!(config.violations(&normal_messages).is_empty());
 
-        let youtube = SignalSnapshot {
+        let youtube_homepage = SignalSnapshot {
             frontmost_app: Some("Google Chrome".to_string()),
-            browser_url: Some("https://www.youtube.com/watch?v=abc".to_string()),
+            browser_url: Some("https://www.youtube.com/".to_string()),
             dnd_enabled: false,
             ..SignalSnapshot::default()
         };
-        assert_eq!(config.violations(&youtube).len(), 1);
+        assert_eq!(config.violations(&youtube_homepage).len(), 1);
+
+        let youtube_video = SignalSnapshot {
+            frontmost_app: Some("Google Chrome".to_string()),
+            browser_url: Some("https://www.youtube.com/watch?v=abc".to_string()),
+            browser_title: Some("A YouTube video".to_string()),
+            dnd_enabled: false,
+            ..SignalSnapshot::default()
+        };
+        assert!(config.violations(&youtube_video).is_empty());
+
+        let youtube_channel = SignalSnapshot {
+            frontmost_app: Some("Google Chrome".to_string()),
+            browser_url: Some("https://www.youtube.com/@some-channel".to_string()),
+            dnd_enabled: false,
+            ..SignalSnapshot::default()
+        };
+        assert!(config.violations(&youtube_channel).is_empty());
+
+        let iphone_youtube_homepage = SignalSnapshot {
+            iphone_safari_tabs: vec![BrowserTab {
+                app: "Andrew's iPhone Safari".to_string(),
+                url: Some("https://m.youtube.com/".to_string()),
+                title: Some("YouTube".to_string()),
+            }],
+            dnd_enabled: false,
+            ..SignalSnapshot::default()
+        };
+        assert_eq!(config.violations(&iphone_youtube_homepage).len(), 1);
+
+        let iphone_youtube_video = SignalSnapshot {
+            iphone_safari_tabs: vec![BrowserTab {
+                app: "Andrew's iPhone Safari".to_string(),
+                url: Some("https://www.youtube.com/watch?v=abc".to_string()),
+                title: Some("A YouTube video".to_string()),
+            }],
+            dnd_enabled: false,
+            ..SignalSnapshot::default()
+        };
+        assert!(config.violations(&iphone_youtube_video).is_empty());
+
+        let iphone_linkedin = SignalSnapshot {
+            iphone_safari_tabs: vec![BrowserTab {
+                app: "Andrew's iPhone Safari".to_string(),
+                url: Some("https://www.linkedin.com/feed/".to_string()),
+                title: Some("LinkedIn".to_string()),
+            }],
+            dnd_enabled: false,
+            ..SignalSnapshot::default()
+        };
+        assert!(config.violations(&iphone_linkedin).is_empty());
     }
 
     #[test]
@@ -725,7 +1016,7 @@ mod tests {
                 SignalRule::new(
                     SignalRuleKind::Website,
                     RuleScope::Always,
-                    "YouTube".to_string()
+                    "YouTube-Homepage".to_string()
                 )
                 .expect("rule")
             )
@@ -735,14 +1026,18 @@ mod tests {
                 SignalRule::new(
                     SignalRuleKind::Website,
                     RuleScope::Dnd,
-                    "YouTube".to_string()
+                    "YouTube-Homepage".to_string()
                 )
                 .expect("rule")
             )
         );
 
         assert_eq!(
-            config.remove_rule(SignalRuleKind::Website, Some(RuleScope::Dnd), "youtube"),
+            config.remove_rule(
+                SignalRuleKind::Website,
+                Some(RuleScope::Dnd),
+                "youtube-homepage"
+            ),
             1
         );
     }
