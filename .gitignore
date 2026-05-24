@@ -1,3 +1,6 @@
+# Local nested repo (LeetCode practice); not part of Pavlov
+leetcode/
+
 .build/
 .swiftpm/
 DerivedData/
